@@ -60,7 +60,7 @@
  *                   host suffixes
  * ============================================================ */
 
-const VERSION = 'mp service 1.1';
+const VERSION = 'mp service 1.2';
 
 /* Monochrome first-party family (suffix match — covers subdomains) */
 const ALLOW = [
@@ -322,10 +322,19 @@ const PATCH_JS = `
   } catch (eN) { /* ignore */ }
 
   /* ---------- messaging ---------- */
-  function up(msg) {
+  function up(msg, transfer) {
     try {
       msg.mp = 1;
-      if (window.parent && window.parent !== window) window.parent.postMessage(msg, '*');
+      if (window.parent && window.parent !== window) {
+        /* a transfer list (ArrayBuffers the caller hands away) rides
+         * the postMessage itself — big worker payloads stay zero-copy
+         * on the way up; anything not transferable falls back to a
+         * plain structured clone. */
+        if (transfer && transfer.length) {
+          try { window.parent.postMessage(msg, '*', transfer); return; } catch (eT) { /* plain clone below */ }
+        }
+        window.parent.postMessage(msg, '*');
+      }
     } catch (e) { /* ignore */ }
   }
 
@@ -1086,6 +1095,16 @@ const PATCH_JS = `
          * converts into a shell re-render. Only shapes that would
          * break the sandbox outright are stopped in this layer. */
         var mHost = (href.match(/^https?:\\/\\/([^\\/?#]+)/i) || [])[1];
+        if (mHost && isWorkerUrl(href)) {
+          /* the worker rewrites the app's OWN links into absolute
+           * worker URLs (/__o/… tokens) — the sidebar, the cards and
+           * the settings links all arrive in this shape. Those are SPA
+           * routes, not external sites: the app router owns them
+           * exactly like the relative form, and flagging them
+           * "outside" was a false alarm that complained at the bottom
+           * of the page while the app still loaded fine. */
+          return;
+        }
         if (mHost && !allowedHost(mHost)) {
           /* external site — never leaves the sandbox */
           e.preventDefault();
@@ -1636,6 +1655,24 @@ const PATCH_JS = `
     try {
       var d = e.data;
       if (!d || d.mp !== 1 || !d.cmd) return;
+      /* capability-bridge events (v1.2) arrive FIRST: worker pipes and
+       * save-picker answers. They only ever come from the parent shell,
+       * they carry app data rather than commands, and they must not be
+       * mistaken for navigation. */
+      if (e.source === window.parent && window.parent !== window) {
+        if (d.cmd === 'wmsg') {
+          try { wDispatch(d.wid, 'message', new MessageEvent('message', { data: d.data })); } catch (eM) { /* ignore */ }
+          return;
+        }
+        if (d.cmd === 'werr') {
+          try { wDispatch(d.wid, 'error', new ErrorEvent('error', { message: d.message || 'worker failed' })); } catch (eE) { /* ignore */ }
+          return;
+        }
+        if (d.cmd === 'sfpok') {
+          try { mpSfpOk(d.pid); } catch (eS) { /* ignore */ }
+          return;
+        }
+      }
       /* trusted senders: the worker itself, and the saved pocket file
        * (file:// origin on Chrome, null on Safari) hosting the
        * sandboxed app view */
@@ -2487,6 +2524,286 @@ const PATCH_JS = `
       try { window.indexedDB = factory; } catch (eSet) { /* ignore */ }
     }
   })();
+
+
+  /* ---------- capability bridges (v1.2) --------------------------------
+   * Monochrome's download engine leans on three powers a null-origin
+   * sandbox can never grant, and every one of them threw SecurityError
+   * there, which is why downloads died:
+   *   1. Web Workers from cross-origin scripts — the ffmpeg.wasm
+   *      transcoder behind every "MP3 320 / 256 / 128 kbps" quality
+   *      preset (the size never changed because the worker never ran).
+   *   2. showSaveFilePicker — the default zip writer.
+   *   3. showDirectoryPicker — the folder / local-media writers.
+   * Each is bridged to the pocket shell, which CAN do it: workers are
+   * spawned in the shell and message-piped both ways; the save pickers
+   * answer fake handles whose createWritable() is a REAL WritableStream
+   * (so pipeTo / write / close all behave) that hands the finished
+   * bytes to the shell's native save path — the true OS save-as when
+   * the browser allows it, the normal download flow otherwise. */
+
+  /* ---- Web Worker bridge ---- */
+  var REAL_WORKER = null;
+  try { REAL_WORKER = window.Worker; } catch (eRW) { REAL_WORKER = null; }
+  var WSEQ = 0;
+  var WBR = {};
+  function wDispatch(wid, type, ev) {
+    var w = WBR[wid];
+    if (!w) return;
+    var f = null;
+    try { f = w['on' + type]; } catch (eF) { f = null; }
+    if (typeof f === 'function') { try { f(ev); } catch (eRun) { /* listener errors are not ours */ } }
+    var ls = w.__ls && w.__ls[type];
+    if (ls) for (var i = 0; i < ls.length; i++) { try { ls[i](ev); } catch (eL) { /* ignore */ } }
+  }
+  /* blob: urls the app hands a worker (the ffmpeg core + wasm it
+   * gunzipped itself) belong to THIS opaque origin — a shell-side
+   * worker could never load them. Every blob: string in a message is
+   * re-read here and shipped as bytes, so the shell can mint its own
+   * blob: urls on the far side. */
+  function mpScanBlobs(obj, found, depth) {
+    try {
+      if (obj == null || depth > 8) return;
+      var t = typeof obj;
+      if (t === 'string') {
+        if (obj.length > 5 && obj.slice(0, 5).toLowerCase() === 'blob:') found.push(obj);
+        return;
+      }
+      if (t !== 'object') return;
+      if (obj instanceof Blob || obj instanceof ArrayBuffer) return;
+      if (Array.isArray(obj)) { for (var i = 0; i < obj.length; i++) mpScanBlobs(obj[i], found, depth + 1); return; }
+      var ks = Object.keys(obj);
+      for (var k = 0; k < ks.length; k++) mpScanBlobs(obj[ks[k]], found, depth + 1);
+    } catch (eS) { /* never let a scan break a message */ }
+  }
+  function mpShipW(wid, data, transfer) {
+    var found = [];
+    mpScanBlobs(data, found, 0);
+    if (!found.length) {
+      try {
+        if (transfer && transfer.length) {
+          try { up({ type: 'wpost', wid: wid, data: data, transfer: transfer }, transfer); return; } catch (eT) { /* plain clone below */ }
+        }
+        up({ type: 'wpost', wid: wid, data: data });
+      } catch (eU) { /* ignore */ }
+      return;
+    }
+    var uniq = found.filter(function (u, i) { return found.indexOf(u) === i; });
+    var jobs = uniq.map(function (u) {
+      return window.fetch(u).then(function (r) {
+        if (!r || !r.ok) throw new Error('blob read failed');
+        return r.blob();
+      }).then(function (b) {
+        return b.arrayBuffer().then(function (buf) { return { u: u, buf: buf, mime: b.type || '' }; });
+      });
+    });
+    Promise.all(jobs).then(function (list) {
+      try {
+        up({
+          type: 'wpost',
+          wid: wid,
+          data: data,
+          brefs: list.map(function (x) { return x.u; }),
+          bmimes: list.map(function (x) { return x.mime; }),
+          bbufs: list.map(function (x) { return x.buf; })
+        });
+      } catch (eU2) { /* ignore */ }
+    }, function () {
+      try { up({ type: 'wpost', wid: wid, data: data }); } catch (eU3) { /* ignore */ }
+    });
+  }
+  function MPWorkerShim(url, opts) {
+    /* same-origin shapes (blob:, data:) still run natively — only the
+     * cross-origin scripts the sandbox forbids are bridged. */
+    try { return new REAL_WORKER(url, opts); } catch (eW) { /* bridged below */ }
+    var wid = ++WSEQ;
+    /* the shell can only spawn workers it can address: relative urls
+     * are resolved against the UPSTREAM document and mapped to the
+     * relay, exactly like every other cross-origin reference here. */
+    var uSend = String(url);
+    try {
+      if (!/^(blob:|data:|https?:|about:)/i.test(uSend)) {
+        var abs = new URL(uSend, DOC || location.href).href;
+        var aHost = (abs.match(/^https?:\\/\\/([^\\/?#]+)/i) || [])[1];
+        uSend = (aHost && allowedHost(aHost)) ? (mapUrl(abs) || abs) : abs;
+      }
+    } catch (eU) { /* keep raw */ }
+    var w = {
+      onmessage: null,
+      onerror: null,
+      __ls: {},
+      __q: Promise.resolve(),
+      postMessage: function (data, transfer) {
+        /* serialized per worker so blob re-reads can never reorder
+         * two messages from the same caller */
+        w.__q = w.__q.then(function () { mpShipW(wid, data, transfer); });
+      },
+      terminate: function () {
+        try { up({ type: 'wend', wid: wid }); } catch (eE) { /* ignore */ }
+        delete WBR[wid];
+      },
+      addEventListener: function (type, fn) {
+        if (typeof fn !== 'function') return;
+        (w.__ls[type] || (w.__ls[type] = [])).push(fn);
+      },
+      removeEventListener: function (type, fn) {
+        var ls = w.__ls[type] || [];
+        var ix = ls.indexOf(fn);
+        if (ix >= 0) ls.splice(ix, 1);
+      }
+    };
+    WBR[wid] = w;
+    up({
+      type: 'wopen',
+      wid: wid,
+      url: uSend,
+      opts: (opts && typeof opts === 'object') ? { type: opts.type || 'classic', name: String(opts.name || '') } : null
+    });
+    return w;
+  }
+  try {
+    if (SD && REAL_WORKER) {
+      window.Worker = MPWorkerShim;
+      try { MPWorkerShim.prototype = REAL_WORKER.prototype; } catch (eProto) { /* instanceof is cosmetic */ }
+    }
+  } catch (eWDef) { /* ignore */ }
+
+  /* ---- save-picker bridge (fake handles over a real WritableStream) -- */
+  var PICKSEQ = 0;
+  var MPICKS = {};
+  function mpChunkPlain(chunk) {
+    try {
+      if (chunk && typeof chunk === 'object' && chunk.type === 'write' && ('data' in chunk)) return chunk.data;
+    } catch (eC) { /* keep whole */ }
+    return chunk;
+  }
+  function mpFakeWritable(name, pid, mime) {
+    var parts = [];
+    /* the REAL WritableStream is what makes pipeTo(body, dest) accept
+     * it (it checks the brand); write/seek/truncate are added as own
+     * methods so the FileSystemWritableFileStream call shape works
+     * too. Both roads land in the same sink. */
+    var ws = new WritableStream({
+      write: function (chunk) {
+        /* positional write forms ({type:'write',position,data}, seek,
+         * truncate) approximate to append — the app writes strictly
+         * front-to-back, so the bytes land in order either way. */
+        parts.push(mpChunkPlain(chunk));
+        return Promise.resolve();
+      },
+      close: function () {
+        var b = null;
+        try { b = new Blob(parts, { type: mime || '' }); } catch (eB) { b = new Blob(parts); }
+        delete MPICKS[pid];
+        up({ type: 'dl', pid: pid, name: String(name), mime: (b && b.type) || '', blob: b });
+        return Promise.resolve();
+      },
+      abort: function () {
+        delete MPICKS[pid];
+        up({ type: 'sfpabort', pid: pid });
+        return Promise.resolve();
+      }
+    });
+    try {
+      var wr = null;
+      var lock = function () { if (!wr) { try { wr = ws.getWriter(); } catch (eG) { wr = null; } } return wr; };
+      ws.write = function (chunk) {
+        var w = lock();
+        if (w) return w.write(mpChunkPlain(chunk));
+        return Promise.resolve();
+      };
+      ws.seek = function () { return Promise.resolve(); };
+      ws.truncate = function () { return Promise.resolve(); };
+      ws.close = function () {
+        var w = lock();
+        return w ? w.close() : Promise.resolve();
+      };
+      ws.abort = function () {
+        var w = lock();
+        return w ? w.abort() : Promise.resolve();
+      };
+    } catch (eExt) { /* a frozen stream still serves pipeTo callers */ }
+    return ws;
+  }
+  function mpFakeFileHandle(name, pid, mime) {
+    return {
+      kind: 'file',
+      name: String(name || 'download'),
+      isFile: true,
+      isDirectory: false,
+      createWritable: function () { return Promise.resolve(mpFakeWritable(name, pid, mime)); },
+      createSyncAccessHandle: function () { return Promise.reject(new Error('sync handles are not available in the pocket')); },
+      getFile: function () { return Promise.reject(new Error('the file is not written yet')); },
+      queryPermission: function () { return Promise.resolve('granted'); },
+      requestPermission: function () { return Promise.resolve('granted'); },
+      isSameEntry: function (other) { return Promise.resolve(!!other && other.pid === pid); }
+    };
+  }
+  function mpEmptyAsyncIter() {
+    return {
+      next: function () { return Promise.resolve({ done: true, value: undefined }); },
+      return: function () { return Promise.resolve({ done: true, value: undefined }); }
+    };
+  }
+  function mpFakeDirHandle(name) {
+    return {
+      kind: 'directory',
+      name: String(name || 'folder'),
+      isFile: false,
+      isDirectory: true,
+      pid: null,
+      getDirectoryHandle: function (n) { return Promise.resolve(mpFakeDirHandle(n)); },
+      getFileHandle: function (n) {
+        var pid = ++PICKSEQ;
+        var mime = '';
+        try { var ext = String(n || '').split('.').pop().toLowerCase(); mime = ({ mp3: 'audio/mpeg', m4a: 'audio/mp4', flac: 'audio/flac', ogg: 'audio/ogg', wav: 'audio/wav', zip: 'application/zip', jpg: 'image/jpeg', png: 'image/png', lrc: 'text/plain', ttml: 'text/xml' })[ext] || ''; } catch (eX) { mime = ''; }
+        return Promise.resolve(mpFakeFileHandle(n, pid, mime));
+      },
+      queryPermission: function () { return Promise.resolve('granted'); },
+      requestPermission: function () { return Promise.resolve('granted'); },
+      removeEntry: function () { return Promise.resolve(); },
+      values: function () { return mpEmptyAsyncIter(); },
+      keys: function () { return mpEmptyAsyncIter(); },
+      entries: function () { return mpEmptyAsyncIter(); },
+      isSameEntry: function () { return Promise.resolve(false); }
+    };
+  }
+  function mpSfpOk(pid) {
+    var p = MPICKS[pid];
+    if (!p) return;
+    delete MPICKS[pid];
+    try { p.resolve(mpFakeFileHandle(p.name, pid, p.mime || '')); } catch (eR) { /* ignore */ }
+  }
+  function mpSfpTimeout(pid) {
+    var p = MPICKS[pid];
+    if (!p) return;
+    delete MPICKS[pid];
+    try { p.reject(new DOMException('The save picker did not answer in time.', 'AbortError')); } catch (eR) { try { p.reject(new Error('The save picker did not answer in time.')); } catch (eR2) { /* ignore */ } }
+  }
+  try {
+    if (SD) {
+      if (typeof window.showSaveFilePicker === 'function' || !('showSaveFilePicker' in window)) {
+        window.showSaveFilePicker = function (opts) {
+          var pid = ++PICKSEQ;
+          var nm = String((opts && opts.suggestedName) || 'download');
+          var pr = new Promise(function (resolve, reject) {
+            MPICKS[pid] = { resolve: resolve, reject: reject, name: nm, mime: '' };
+            setTimeout(function () { mpSfpTimeout(pid); }, 90000);
+          });
+          up({ type: 'sfp', pid: pid, name: nm });
+          return pr;
+        };
+      }
+      if (typeof window.showDirectoryPicker === 'function' || !('showDirectoryPicker' in window)) {
+        window.showDirectoryPicker = function () {
+          /* folder mode: a virtual folder whose files each go through
+           * the native save flow — the app sees a working directory,
+           * the phone sees one save per file, nothing is lost. */
+          return Promise.resolve(mpFakeDirHandle('Monochrome'));
+        };
+      }
+    }
+  } catch (ePick) { /* ignore */ }
 
 
   /* ---------- escape sentinel ------------------------------------------
