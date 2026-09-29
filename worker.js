@@ -60,13 +60,22 @@
  *                   host suffixes
  * ============================================================ */
 
-const VERSION = 'mp service 1.0';
+const VERSION = 'mp service 1.1';
 
 /* Monochrome first-party family (suffix match — covers subdomains) */
 const ALLOW = [
   'monochrome.st',      // the app + auth. + data. + tracks. subdomains
   'monochrome.tf',      // the canonical name + hot. explore endpoints
+  'monochrome.qzz.io',  // PocketBase file storage (uploads. + images.)
   'resources.tidal.com',// album-art CDN the app embeds
+  'auth.tidal.com',     // TIDAL OAuth token refresh (playback gate)
+  'api.tidal.com',      // TIDAL catalog + stream manifests
+  'openapi.tidal.com',  // TIDAL open API (search fallback)
+  'tidal.com',          // www. + plain redirects
+  'audioscrobbler.com', // last.fm scrobbling (ws.)
+  'api.podcastindex.org',// podcast search
+  'github.com',         // AutoEq EQ profile browser (api. + raw.)
+  'githubusercontent.com',
   'fonts.googleapis.com',// webfont css (preconnected at boot)
   'fonts.gstatic.com'   // webfont files
 ];
@@ -172,6 +181,7 @@ const PATCH_JS = `
 
   var jar = [];                       // fallback cookie jar (mirrored by the shell)
   var lsMirror = {};                  // fallback localStorage mirror (for browsers that block it in iframes)
+  var __histState = undefined;        // history.state payload parked by the pushState/replaceState shims (sandbox)
 
   /* ---------- absolute worker URLs --------------------------------
    * Inside the sandbox frame the document sits at about:srcdoc, so a
@@ -244,13 +254,29 @@ const PATCH_JS = `
     loc.toString = function () { return LOC.u ? LOC.u.href : (DOC || 'about:srcdoc'); };
     ['origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash'].forEach(function (k) {
       try {
-        Object.defineProperty(loc, k, {
+        var def = {
           get: function () {
             if (!LOC.u) return k === 'origin' || k === 'host' || k === 'hostname' ? '' : (k === 'protocol' ? 'https:' : (k === 'pathname' ? '/' : ''));
             return LOC.u[k];
           },
           configurable: true
-        });
+        };
+        /* writable location parts: a hash write stays in-document (the
+         * router polls it); pathname/search writes are navigations. */
+        if (k === 'hash') {
+          def.set = function (v) {
+            try {
+              var base = LOC.u ? LOC.u.href.replace(/#.*$/, '') : (DOC || '/');
+              setLoc(base + '#' + String(v).replace(/^#/, ''));
+              try { window.dispatchEvent(new Event('hashchange')); } catch (eHG) { /* ignore */ }
+            } catch (eH) { /* ignore */ }
+          };
+        } else if (k === 'pathname' || k === 'search') {
+          def.set = function (v) {
+            try { var u = new URL(String(v), LOC.u || DOC || '/'); nav(u.href); } catch (eS) { /* ignore */ }
+          };
+        }
+        Object.defineProperty(loc, k, def);
       } catch (e) { /* ignore */ }
     });
     return loc;
@@ -832,8 +858,10 @@ const PATCH_JS = `
          * as a SOFT transition: tell the shell the new URL (worker path +
          * upstream URL). ALSO advance the fake location — routers re-read
          * window.location.pathname to re-resolve routes after SPA
-         * transitions. */
+         * transitions — and park the caller's state object on
+         * __histState so history.state reads back like the real thing. */
         try {
+          __histState = (arguments.length > 0) ? arguments[0] : undefined;
           var su = (arguments.length > 2 && arguments[2] != null) ? String(arguments[2]) : '';
           if (su && su.charAt(0) !== '#') {
             var sAbs = '';
@@ -854,6 +882,7 @@ const PATCH_JS = `
     history.replaceState = function () {
       if (SD) {
         try {
+          __histState = (arguments.length > 0) ? arguments[0] : undefined;
           var ru = (arguments.length > 2 && arguments[2] != null) ? String(arguments[2]) : '';
           if (ru && ru.charAt(0) !== '#') {
             var rAbs = '';
@@ -884,11 +913,15 @@ const PATCH_JS = `
     if (window.navigation && window.navigation.addEventListener) {
       window.navigation.addEventListener('navigate', function (e) {
         try {
-          if (!e.canIntercept || !e.destination || e.destination.sameDocument) return;
+          if (!e.destination || e.destination.sameDocument) return;
           var dest = String(e.destination.url || '');
           if (!dest) return;
           if (SD) {
-            e.preventDefault();
+            /* canIntercept is false for cross-origin destinations, but
+             * preventDefault still works there - only intercept() would
+             * not - so the gate is dropped in sandbox mode: EVERY
+             * navigation must be stopped, the shell re-renders instead. */
+            try { e.preventDefault(); } catch (ePV) { /* ignore */ }
             if (isWorkerUrl(dest)) { nav(dest); return; } /* already proxied */
             if (/^https?:\\/\\//i.test(dest) && !allowedHost((dest.match(/^https?:\\/\\/([^\\/?#]+)/i) || [])[1])) {
               up({ type: 'ext', url: dest });
@@ -898,6 +931,7 @@ const PATCH_JS = `
             nav(dest);
             return;
           }
+          if (!e.canIntercept) return;
           var org = originStr();
           if (org && (dest === org || dest.indexOf(org + '/') === 0)) {
             var p = dest.slice(org.length) || '/';
@@ -1042,16 +1076,31 @@ const PATCH_JS = `
       if (!href || href.charAt(0) === '#' || /^(data|blob|javascript|mailto|tel):/i.test(href)) return;
       var target = (a.target || '').toLowerCase();
       if (SD) {
-        /* sandbox: NOTHING navigates — every link becomes a nav()
-         * postMessage and the shell re-renders a fresh srcdoc. */
-        e.preventDefault();
-        if (isWorkerUrl(href)) { nav(href); return; } /* worker-rewritten attr */
-        if (/^https?:\\/\\//i.test(href) && !allowedHost((href.match(/^https?:\\/\\/([^\\/?#]+)/i) || [])[1])) {
+        /* sandbox: the APP's own router owns same-app links now — its
+         * delegated body listener compares the anchor origin with
+         * location.origin (the anchor shim makes both read as the
+         * upstream origin) and turns clicks into SPA transitions
+         * through the pushState shim. Same-app clicks are NOT
+         * intercepted here; anything the router declines falls through
+         * to a native navigation, which the Navigation-API watcher
+         * converts into a shell re-render. Only shapes that would
+         * break the sandbox outright are stopped in this layer. */
+        var mHost = (href.match(/^https?:\\/\\/([^\\/?#]+)/i) || [])[1];
+        if (mHost && !allowedHost(mHost)) {
+          /* external site — never leaves the sandbox */
+          e.preventDefault();
           up({ type: 'ext', url: href });
           pageToast('Blocked (outside the proxy): ' + href);
           return;
         }
-        nav(href);
+        if (target === '_top' || target === '_parent' || target === '_blank') {
+          /* popups are impossible without allow-popups — open in-frame */
+          e.preventDefault();
+          nav(href);
+          return;
+        }
+        /* allowlisted / worker / relative hrefs: the app's router has
+         * the click; the nav-API watcher is the safety net */
         return;
       }
       var mapped = mapUrl(href);
@@ -1646,6 +1695,799 @@ const PATCH_JS = `
       }
     } catch (err) { /* ignore */ }
   });
+
+  /* ---------- sandbox shims: history state, anchors, clipboard ------
+   * Monochrome is a real SPA: its router pushes history entries and
+   * re-dispatches popstate, its link handler compares anchor origins
+   * with location.origin, and parts of its UI keep state on
+   * history.state. In a null-origin frame all of that needs help. */
+
+  /* history.state: the pushState/replaceState shims below cannot mint
+   * real entries (the native calls would throw), so they park the
+   * caller's state object on __histState and this getter serves it. */
+  try {
+    if (SD) {
+      var hsDesc = Object.getOwnPropertyDescriptor(History.prototype, 'state');
+      if (hsDesc && hsDesc.get) {
+        Object.defineProperty(History.prototype, 'state', {
+          get: function () { return __histState; },
+          configurable: true
+        });
+      }
+      /* native back/forward would walk stale srcdoc snapshots — the
+       * shell owns the real stack, so route these to it. */
+      history.back = function () { up({ type: 'goback' }); };
+      history.forward = function () { up({ type: 'gofwd' }); };
+      history.go = function (d) { up({ type: (d < 0) ? 'goback' : 'gofwd' }); };
+    }
+  } catch (eHist) { /* ignore */ }
+
+  /* decode an opaque token (mirror of the worker's decTok) */
+  function decTok(t) {
+    try {
+      if (!KEY) return null;
+      var b64 = atob(String(t || '').replace(/-/g, '+').replace(/_/g, '/'));
+      var bytes = new Uint8Array(b64.length);
+      for (var i = 0; i < b64.length; i++) bytes[i] = b64.charCodeAt(i) ^ KEY.charCodeAt(i % KEY.length);
+      return new TextDecoder().decode(bytes);
+    } catch (eDT) { return null; }
+  }
+
+  /* the upstream URL an href really points to: worker /__o/ and /__t/
+   * URLs are decoded back to their upstream form, plain allowlisted
+   * and relative hrefs are resolved against the upstream doc URL. */
+  function upstreamOfHref(raw) {
+    try {
+      var s = String(raw == null ? '' : raw);
+      if (!s || s.charAt(0) === '#') return null;
+      if (/^(data|blob|about|javascript|mailto|tel|sms|intent|ms-|chrome|file):/i.test(s)) return null;
+      var workerOrigin = String(WORKER || '').replace(/\\/$/, '');
+      var wOrg = '';
+      try { if (workerOrigin) wOrg = new URL(workerOrigin).origin; } catch (eWO) { wOrg = ''; }
+      var u = null;
+      try { u = new URL(s, workerOrigin || DOC || 'https://x.invalid/'); } catch (eU) { return null; }
+      if (!u) return null;
+      if (wOrg && u.origin === wOrg) {
+        var mO = u.pathname.match(/^\\/__o\\/([A-Za-z0-9_-]{8,})(\\/.*)?$/);
+        if (mO) {
+          var org = decTok(mO[1]);
+          if (!org) return null;
+          try { return new URL(org + (mO[2] || '/') + u.search + u.hash); } catch (eO) { return null; }
+        }
+        var mT = u.pathname.match(/^\\/__t\\/([A-Za-z0-9_-]{8,})$/);
+        if (mT) {
+          var full = decTok(mT[1]);
+          if (!full) return null;
+          try { return new URL(full); } catch (eT) { return null; }
+        }
+        return null; /* other worker paths are not app links */
+      }
+      var u2 = null;
+      try { u2 = new URL(s, DOC || undefined); } catch (eR) { return null; }
+      if (!u2) return null;
+      if (!/^https?:$/.test(u2.protocol)) return null;
+      return u2;
+    } catch (eUU) { return null; }
+  }
+
+  /* anchor property shim: a.origin/pathname/host/... report the
+   * UPSTREAM values, so the app's link router
+   * (a.origin === location.origin) recognizes its own links and turns
+   * clicks into SPA transitions instead of full navigations. The href
+   * ATTRIBUTE stays the worker URL — every proxy mechanism (click
+   * capture, download bridge, nav watcher) keeps working unchanged. */
+  (function shimAnchors() {
+    try {
+      if (!SD) return;
+      var proto = window.HTMLAnchorElement && window.HTMLAnchorElement.prototype;
+      if (!proto) return;
+      ['origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash'].forEach(function (k) {
+        try {
+          var d = Object.getOwnPropertyDescriptor(proto, k);
+          if (!d || !d.get) return;
+          Object.defineProperty(proto, k, {
+            get: function () {
+              try {
+                var raw = this.getAttribute('href');
+                var up = raw == null ? null : upstreamOfHref(raw);
+                if (up && allowedHost(up.hostname)) return up[k];
+              } catch (eG) { /* fall through to native */ }
+              return d.get.call(this);
+            },
+            configurable: true,
+            enumerable: d.enumerable
+          });
+        } catch (eP) { /* ignore */ }
+      });
+    } catch (eSA) { /* ignore */ }
+  })();
+
+  /* clipboard: the sandbox cannot touch the real one — hand writes to
+   * the shell, which copies from the trusted file:// page. */
+  try {
+    if (SD && navigator.clipboard) {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        get: function () {
+          return {
+            writeText: function (t) { up({ type: 'copy', text: String(t) }); return Promise.resolve(undefined); },
+            readText: function () { return Promise.reject(new Error('the clipboard is not readable inside the sandbox')); }
+          };
+        }
+      });
+    }
+  } catch (eClip) { /* ignore */ }
+
+  /* ---------- in-memory IndexedDB (sandbox) ---------------------------
+   * A null-origin frame cannot open IndexedDB at all — the call throws
+   * SecurityError — and Monochrome's whole boot chain awaits its
+   * storage layer (settings, favorites, history, pinned items, the
+   * response cache). One throw there leaves the UI rendered but inert:
+   * no handlers, no router, nothing clickable. This shim installs a
+   * compact in-memory IndexedDB that answers everything the app asks
+   * for (open + upgrade, transactions, stores, indexes, cursors,
+   * key ranges) and mirrors writes to the shell so settings and
+   * favorites survive srcdoc swaps and file reloads. */
+  (function setupIDB() {
+    if (!SD) return;
+    var probeOK = true;
+    try { window.indexedDB.open('__mp_idb_probe__', 1); } catch (ePr) { probeOK = false; }
+    if (probeOK) return; /* real IndexedDB works here — leave it alone */
+
+    /* the TTL response cache never persists — only the app's own DB */
+    var PERSIST_DBS = { MonochromeDB: 1 };
+
+    /* -- tiny event machinery -- */
+    function Ev(name) { this.type = name; this.target = null; this.defaultPrevented = false; }
+    Ev.prototype.preventDefault = function () { this.defaultPrevented = true; };
+    Ev.prototype.stopPropagation = function () { };
+    Ev.prototype.stopImmediatePropagation = function () { };
+    function Emitter() { this.__h = {}; }
+    Emitter.prototype.addEventListener = function (t, fn) { if (typeof fn === 'function') { (this.__h[t] = this.__h[t] || []).push(fn); } };
+    Emitter.prototype.removeEventListener = function (t, fn) { var a = this.__h[t]; if (!a) return; var i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); };
+    Emitter.prototype.dispatchEvent = function (ev) {
+      try { ev.target = ev.target || this; } catch (eT) { /* ignore */ }
+      var a = this.__h[ev.type];
+      if (a) {
+        a = a.slice();
+        for (var i = 0; i < a.length; i++) { try { a[i].call(this, ev); } catch (eH) { /* ignore */ } }
+      }
+      var f = this['on' + ev.type];
+      if (typeof f === 'function') { try { f.call(this, ev); } catch (eF) { /* ignore */ } }
+      return !ev.defaultPrevented;
+    };
+    var sched = function (f) { setTimeout(f, 0); };
+
+    /* -- keys -- */
+    function typeOrd(k) {
+      if (typeof k === 'number') return 0;
+      if (k instanceof Date) return 1;
+      if (typeof k === 'string') return 2;
+      if (Array.isArray(k)) return 3;
+      return 4;
+    }
+    function cmpKeys(a, b) {
+      var ta = typeOrd(a), tb = typeOrd(b);
+      if (ta !== tb) return ta < tb ? -1 : 1;
+      if (ta === 0) return a < b ? -1 : (a > b ? 1 : 0);
+      if (ta === 1) { var x = a.getTime(), y = b.getTime(); return x < y ? -1 : (x > y ? 1 : 0); }
+      if (ta === 2) return a < b ? -1 : (a > b ? 1 : 0);
+      if (ta === 3) {
+        var n = Math.min(a.length, b.length);
+        for (var i = 0; i < n; i++) { var c = cmpKeys(a[i], b[i]); if (c) return c; }
+        return a.length - b.length;
+      }
+      return 0;
+    }
+    function inRange(k, r) {
+      if (!r) return true;
+      try {
+        if (r.lower !== undefined && r.lower !== null) {
+          var c = cmpKeys(k, r.lower);
+          if (c < 0 || (c === 0 && r.lowerOpen)) return false;
+        }
+        if (r.upper !== undefined && r.upper !== null) {
+          var c2 = cmpKeys(k, r.upper);
+          if (c2 > 0 || (c2 === 0 && r.upperOpen)) return false;
+        }
+      } catch (eR) { /* treat as in-range */ }
+      return true;
+    }
+    function errObj(name, msg) { var e = new Error(msg || name); e.name = name; return e; }
+    function keyPathValue(val, kp) {
+      if (kp == null) return undefined;
+      if (typeof kp === 'string') {
+        if (kp.indexOf('.') < 0) { try { return val == null ? undefined : val[kp]; } catch (e) { return undefined; } }
+        var cur = val, parts = kp.split('.');
+        for (var i = 0; i < parts.length; i++) {
+          if (cur == null) return undefined;
+          try { cur = cur[parts[i]]; } catch (e2) { return undefined; }
+        }
+        return cur;
+      }
+      if (Array.isArray(kp)) {
+        var out = [];
+        for (var j = 0; j < kp.length; j++) out.push(keyPathValue(val, kp[j]));
+        return out;
+      }
+      return undefined;
+    }
+    function kser(k) {
+      if (typeof k === 'number') return 'n:' + k;
+      if (typeof k === 'string') return 's:' + k;
+      if (k instanceof Date) return 'd:' + k.getTime();
+      try { return 'j:' + JSON.stringify(k); } catch (e) { return 's:' + String(k); }
+    }
+    function kunser(s) {
+      try {
+        var t = String(s || '').charAt(0), rest = String(s).slice(2);
+        if (t === 'n') { var n = Number(rest); return isNaN(n) ? rest : n; }
+        if (t === 'd') { var d = new Date(Number(rest)); return isNaN(d.getTime()) ? rest : d; }
+        if (t === 'j') { try { return JSON.parse(rest); } catch (eJ) { return rest; } }
+        return rest;
+      } catch (e) { return s; }
+    }
+    function persist(db, store, op, k, v) {
+      try {
+        if (!PERSIST_DBS[db]) return;
+        var msg = { type: 'idb', db: db, store: store, op: op };
+        if (op === 'put') { msg.ks = kser(k); msg.v = v; }
+        else if (op === 'del') msg.ks = kser(k);
+        up(msg);
+      } catch (eP) { /* ignore */ }
+    }
+
+    /* -- object store -- */
+    function IDBStore(db, name, opts) {
+      Emitter.call(this);
+      this.__db = db;
+      this.name = name;
+      this.keyPath = (opts && opts.keyPath !== undefined) ? opts.keyPath : null;
+      this.autoIncrement = !!(opts && opts.autoIncrement);
+      this.__data = new Map();
+      this.__keyGen = 1;
+      this.__indexes = {};
+    }
+    IDBStore.prototype = Object.create(Emitter.prototype);
+    IDBStore.prototype.__indexOne = function (ix, pk, value) {
+      var ik = keyPathValue(value, ix.keyPath);
+      if (ik === undefined || ik === null) return;
+      if (ix.unique) { ix.map.set(ik, [pk]); return; }
+      var arr = ix.map.get(ik);
+      if (!arr) { ix.map.set(ik, [pk]); return; }
+      if (arr.indexOf(pk) < 0) arr.push(pk);
+    };
+    IDBStore.prototype.__unindexOne = function (ix, pk, oldValue) {
+      var ik = keyPathValue(oldValue, ix.keyPath);
+      if (ik === undefined || ik === null) return;
+      var arr = ix.map.get(ik);
+      if (!arr) return;
+      var i = arr.indexOf(pk);
+      if (i >= 0) arr.splice(i, 1);
+      if (!arr.length) ix.map.delete(ik);
+    };
+    IDBStore.prototype.__indexAdd = function (pk, value) {
+      var names = Object.keys(this.__indexes);
+      for (var i = 0; i < names.length; i++) this.__indexOne(this.__indexes[names[i]], pk, value);
+    };
+    IDBStore.prototype.__indexRemove = function (pk, oldValue) {
+      var names = Object.keys(this.__indexes);
+      for (var i = 0; i < names.length; i++) this.__unindexOne(this.__indexes[names[i]], pk, oldValue);
+    };
+    IDBStore.prototype.createIndex = function (name, keyPath, opts) {
+      if (this.__indexes[name]) throw errObj('ConstraintError', 'index already exists: ' + name);
+      var ix = { name: name, keyPath: keyPath, unique: !!(opts && opts.unique), multiEntry: !!(opts && opts.multiEntry), map: new Map() };
+      this.__indexes[name] = ix;
+      var self = this;
+      this.__data.forEach(function (v, k) { self.__indexOne(ix, k, v); });
+      return new IndexView(null, this, ix);
+    };
+    IDBStore.prototype.deleteIndex = function (name) { delete this.__indexes[name]; };
+
+    function namesList(names) {
+      var o = { length: names.length, item: function (i) { return names[i] || null; }, contains: function (n) { return names.indexOf(String(n)) >= 0; } };
+      for (var i = 0; i < names.length; i++) o[i] = names[i];
+      return o;
+    }
+
+    /* -- request -- */
+    function IDBRequest(source, tx) {
+      Emitter.call(this);
+      this.__source = source || null;
+      this.transaction = tx || null;
+      this.result = undefined;
+      this.error = null;
+      this.readyState = 'pending';
+    }
+    IDBRequest.prototype = Object.create(Emitter.prototype);
+    Object.defineProperty(IDBRequest.prototype, 'source', { get: function () { return this.__source; }, configurable: true });
+    function okReq(r, res) {
+      r.readyState = 'done';
+      r.result = res;
+      r.dispatchEvent(new Ev('success'));
+    }
+    function failReq(r, err) {
+      r.readyState = 'done';
+      r.error = err;
+      r.dispatchEvent(new Ev('error'));
+    }
+
+    /* -- transaction -- */
+    function IDBTx(db, names, mode) {
+      Emitter.call(this);
+      this.__db = db;
+      this.mode = mode || 'readonly';
+      this.__names = names.slice();
+      this.__active = true;
+      this.__pend = 0;
+      this.__dead = false;
+      this.error = null;
+      this.oncomplete = null; this.onabort = null; this.onerror = null;
+    }
+    IDBTx.prototype = Object.create(Emitter.prototype);
+    Object.defineProperty(IDBTx.prototype, 'objectStoreNames', { get: function () { return namesList(this.__names); }, configurable: true });
+    IDBTx.prototype.objectStore = function (name) {
+      if (this.__names.indexOf(name) < 0) throw errObj('NotFoundError', 'store not in this transaction: ' + name);
+      if (!this.__active) throw errObj('TransactionInactiveError', 'transaction is no longer active');
+      var st = this.__db.__stores[name];
+      if (!st) throw errObj('NotFoundError', 'no such store: ' + name);
+      return new StoreView(this, st);
+    };
+    IDBTx.prototype.__arm = function () {
+      var self = this;
+      sched(function () { self.__checkComplete(); });
+    };
+    IDBTx.prototype.__checkComplete = function () {
+      if (this.__dead || this.__pend > 0) return;
+      this.__dead = true;
+      this.__active = false;
+      var self = this;
+      sched(function () { self.dispatchEvent(new Ev('complete')); });
+    };
+    IDBTx.prototype.__reqDone = function () { this.__pend--; this.__checkComplete(); };
+    IDBTx.prototype.__reqFail = function (err) { this.__pend--; this.error = err; this.__checkComplete(); };
+    IDBTx.prototype.abort = function () {
+      if (this.__dead) return;
+      this.__dead = true;
+      this.__active = false;
+      this.dispatchEvent(new Ev('abort'));
+    };
+    IDBTx.prototype.commit = function () { /* writes apply in place — nothing to flush */ };
+
+    /* -- store view (what tx.objectStore() hands out) -- */
+    function StoreView(tx, store) {
+      this.__tx = tx;
+      this.__st = store;
+      tx.__pend++;
+      var self = this;
+      sched(function () { self.__tx.__reqDone(); }); /* views count as one pending op so empty txs still complete */
+    }
+    function viewNames(v) { return namesList(Object.keys(v.__st.__indexes)); }
+
+    StoreView.prototype = {
+      __count: function () { this.__tx.__pend++; },
+      get name() { return this.__st.name; },
+      get keyPath() { return this.__st.keyPath; },
+      get autoIncrement() { return this.__st.autoIncrement; },
+      get indexNames() { return viewNames(this); },
+      index: function (n) {
+        var ix = this.__st.__indexes[n];
+        if (!ix) throw errObj('NotFoundError', 'no such index: ' + n);
+        return new IndexView(this, this.__st, ix);
+      },
+      createIndex: function (n, kp, o) { return this.__st.createIndex(n, kp, o); },
+      deleteIndex: function (n) { this.__st.deleteIndex(n); },
+      get: function (key) {
+        var r = new IDBRequest(this, this.__tx);
+        var st = this.__st, tx = this.__tx;
+        this.__count();
+        sched(function () {
+          try { okReq(r, st.__data.get(key)); tx.__reqDone(); }
+          catch (e) { failReq(r, e); tx.__reqFail(e); }
+        });
+        return r;
+      },
+      getAll: function (range) {
+        var r = new IDBRequest(this, this.__tx);
+        var st = this.__st, tx = this.__tx;
+        this.__count();
+        sched(function () {
+          try {
+            var out = [];
+            var keys = [];
+            st.__data.forEach(function (v, k) { if (inRange(k, range)) keys.push(k); });
+            keys.sort(function (a, b) { return cmpKeys(a, b); });
+            keys.forEach(function (k) { out.push(st.__data.get(k)); });
+            okReq(r, out); tx.__reqDone();
+          } catch (e) { failReq(r, e); tx.__reqFail(e); }
+        });
+        return r;
+      },
+      getAllKeys: function (range) {
+        var r = new IDBRequest(this, this.__tx);
+        var st = this.__st, tx = this.__tx;
+        this.__count();
+        sched(function () {
+          try {
+            var keys = [];
+            st.__data.forEach(function (v, k) { if (inRange(k, range)) keys.push(k); });
+            keys.sort(function (a, b) { return cmpKeys(a, b); });
+            okReq(r, keys); tx.__reqDone();
+          } catch (e) { failReq(r, e); tx.__reqFail(e); }
+        });
+        return r;
+      },
+      count: function () {
+        var r = new IDBRequest(this, this.__tx);
+        var st = this.__st, tx = this.__tx;
+        this.__count();
+        sched(function () {
+          try { okReq(r, st.__data.size); tx.__reqDone(); }
+          catch (e) { failReq(r, e); tx.__reqFail(e); }
+        });
+        return r;
+      },
+      put: function (value, key) { return this.__write('put', value, key); },
+      add: function (value, key) { return this.__write('add', value, key); },
+      __write: function (kind, value, key) {
+        var r = new IDBRequest(this, this.__tx);
+        var st = this.__st, tx = this.__tx;
+        this.__count();
+        sched(function () {
+          try {
+            var k = (key !== undefined && key !== null) ? key : (st.keyPath != null ? keyPathValue(value, st.keyPath) : undefined);
+            if (k === undefined || k === null) {
+              if (st.autoIncrement) { k = st.__keyGen++; }
+              else { var de = errObj('DataError', 'the object could not be keyed'); failReq(r, de); tx.__reqFail(de); return; }
+            }
+            var old = st.__data.get(k);
+            if (kind === 'add' && old !== undefined) { var ce = errObj('ConstraintError', 'key already exists'); failReq(r, ce); tx.__reqFail(ce); return; }
+            if (old !== undefined) st.__indexRemove(k, old);
+            st.__data.set(k, value);
+            st.__indexAdd(k, value);
+            if (typeof k === 'number' && k >= st.__keyGen) st.__keyGen = k + 1;
+            persist(st.__db.name, st.name, 'put', k, value);
+            okReq(r, k); tx.__reqDone();
+          } catch (e) { failReq(r, e); tx.__reqFail(e); }
+        });
+        return r;
+      },
+      delete: function (key) {
+        var r = new IDBRequest(this, this.__tx);
+        var st = this.__st, tx = this.__tx;
+        this.__count();
+        sched(function () {
+          try {
+            var old = st.__data.get(key);
+            if (old !== undefined) {
+              st.__data.delete(key);
+              st.__indexRemove(key, old);
+              persist(st.__db.name, st.name, 'del', key);
+            }
+            okReq(r, undefined); tx.__reqDone();
+          } catch (e) { failReq(r, e); tx.__reqFail(e); }
+        });
+        return r;
+      },
+      clear: function () {
+        var r = new IDBRequest(this, this.__tx);
+        var st = this.__st, tx = this.__tx;
+        this.__count();
+        sched(function () {
+          try {
+            if (st.__data.size) { st.__data.clear(); Object.keys(st.__indexes).forEach(function (n) { st.__indexes[n].map.clear(); }); persist(st.__db.name, st.name, 'clear'); }
+            okReq(r, undefined); tx.__reqDone();
+          } catch (e) { failReq(r, e); tx.__reqFail(e); }
+        });
+        return r;
+      },
+      openCursor: function (range, dir) { return openCursorReq(this, this.__st, null, range, dir); }
+    };
+
+    /* -- index view -- */
+    function IndexView(view, store, ix) {
+      this.__view = view;
+      this.__st = store;
+      this.__ix = ix;
+    }
+    IndexView.prototype = {
+      get name() { return this.__ix.name; },
+      get keyPath() { return this.__ix.keyPath; },
+      get unique() { return this.__ix.unique; },
+      get multiEntry() { return this.__ix.multiEntry; },
+      get objectStore() { return this.__st; },
+      __pairs: function (range, dir) {
+        var pairs = [];
+        this.__ix.map.forEach(function (pks, ik) {
+          pks.forEach(function (pk) { pairs.push({ ik: ik, pk: pk }); });
+        });
+        pairs.sort(function (a, b) { var c = cmpKeys(a.ik, b.ik); if (c) return c; return cmpKeys(a.pk, b.pk); });
+        if (String(dir || 'next').indexOf('prev') === 0) pairs.reverse();
+        return pairs.filter(function (p) { return inRange(p.ik, range); });
+      },
+      get: function (k) {
+        var r = new IDBRequest(this, this.__view ? this.__view.__tx : null);
+        var st = this.__st, ix = this.__ix, tx = this.__view ? this.__view.__tx : null;
+        if (tx) tx.__pend++;
+        sched(function () {
+          try {
+            var pks = ix.map.get(k);
+            var v = pks && pks.length ? st.__data.get(pks[0]) : undefined;
+            okReq(r, v === undefined ? undefined : v);
+            if (tx) tx.__reqDone();
+          } catch (e) { failReq(r, e); if (tx) tx.__reqFail(e); }
+        });
+        return r;
+      },
+      getAll: function (range) {
+        var r = new IDBRequest(this, this.__view ? this.__view.__tx : null);
+        var st = this.__st, self = this, tx = this.__view ? this.__view.__tx : null;
+        if (tx) tx.__pend++;
+        sched(function () {
+          try {
+            var out = self.__pairs(range, 'next').map(function (p) { return st.__data.get(p.pk); });
+            okReq(r, out);
+            if (tx) tx.__reqDone();
+          } catch (e) { failReq(r, e); if (tx) tx.__reqFail(e); }
+        });
+        return r;
+      },
+      getAllKeys: function (range) {
+        var r = new IDBRequest(this, this.__view ? this.__view.__tx : null);
+        var self = this, tx = this.__view ? this.__view.__tx : null;
+        if (tx) tx.__pend++;
+        sched(function () {
+          try {
+            okReq(r, self.__pairs(range, 'next').map(function (p) { return p.pk; }));
+            if (tx) tx.__reqDone();
+          } catch (e) { failReq(r, e); if (tx) tx.__reqFail(e); }
+        });
+        return r;
+      },
+      count: function (range) {
+        var r = new IDBRequest(this, this.__view ? this.__view.__tx : null);
+        var self = this, tx = this.__view ? this.__view.__tx : null;
+        if (tx) tx.__pend++;
+        sched(function () {
+          try { okReq(r, self.__pairs(range, 'next').length); if (tx) tx.__reqDone(); }
+          catch (e) { failReq(r, e); if (tx) tx.__reqFail(e); }
+        });
+        return r;
+      },
+      openCursor: function (range, dir) { return openCursorReq(this, this.__st, this.__ix, range, dir); }
+    };
+
+    /* -- cursor -- */
+    function openCursorReq(view, store, ix, range, dir) {
+      var tx = view ? (view.__tx || (view.__view && view.__view.__tx)) : null;
+      var r = new IDBRequest(view, tx);
+      var cur = new IDBCursor(view, store, ix, range, dir, r);
+      if (tx) tx.__pend++;
+      cur.__step(0);
+      return r;
+    }
+    function IDBCursor(view, store, ix, range, dir, req) {
+      this.__view = view;
+      this.__st = store;
+      this.__ix = ix;
+      this.__range = range;
+      this.__dir = String(dir || 'next');
+      this.__req = req;
+      this.direction = this.__dir;
+      this.source = ix ? new IndexView(view, store, ix) : view;
+      var entries = [];
+      var self = this;
+      if (ix) {
+        var pairs = [];
+        ix.map.forEach(function (pks, ik) { pks.forEach(function (pk) { pairs.push({ ik: ik, pk: pk }); }); });
+        pairs.sort(function (a, b) { var c = cmpKeys(a.ik, b.ik); if (c) return c; return cmpKeys(a.pk, b.pk); });
+        if (this.__dir.indexOf('prev') === 0) pairs.reverse();
+        pairs.forEach(function (p) { if (inRange(p.ik, range)) entries.push(p); });
+      } else {
+        var ks = [];
+        store.__data.forEach(function (v, k) { ks.push(k); });
+        ks.sort(function (a, b) { return cmpKeys(a, b); });
+        if (this.__dir.indexOf('prev') === 0) ks.reverse();
+        ks.forEach(function (k) { if (inRange(k, range)) entries.push({ ik: k, pk: k }); });
+      }
+      if (this.__dir.indexOf('unique') >= 0) {
+        var seen = {}, ded = [];
+        entries.forEach(function (p) {
+          var id = kser(p.ik);
+          if (!seen[id]) { seen[id] = 1; ded.push(p); }
+        });
+        entries = ded;
+      }
+      this.__entries = entries;
+      this.__pos = -1;
+      this.key = undefined;
+      this.primaryKey = undefined;
+      this.value = undefined;
+    }
+    IDBCursor.prototype.__step = function (n) {
+      var self = this;
+      this.__pos += (n || 1);
+      sched(function () {
+        var e = self.__entries[self.__pos];
+        var req = self.__req;
+        var tx = req ? req.transaction : null;
+        if (!e) {
+          if (req) { req.readyState = 'done'; req.result = null; req.dispatchEvent(new Ev('success')); }
+          if (tx) tx.__reqDone();
+          return;
+        }
+        if (self.__ix) { self.key = e.ik; } else { self.key = e.pk; }
+        self.primaryKey = e.pk;
+        self.value = self.__st.__data.get(e.pk);
+        if (req) { req.readyState = 'done'; req.result = self; req.dispatchEvent(new Ev('success')); }
+      });
+    };
+    IDBCursor.prototype.continue = function () { this.__step(1); };
+    IDBCursor.prototype.advance = function (n) { this.__step(Math.max(1, n | 0)); };
+    IDBCursor.prototype.delete = function () {
+      var view = this.__view;
+      var r = new IDBRequest(view, view && view.__tx);
+      var st = this.__st, pk = this.primaryKey, tx = view && view.__tx;
+      if (tx) tx.__pend++;
+      var self = this;
+      sched(function () {
+        try {
+          var old = st.__data.get(pk);
+          if (old !== undefined) {
+            st.__data.delete(pk);
+            st.__indexRemove(pk, old);
+            persist(st.__db.name, st.name, 'del', pk);
+          }
+          okReq(r, undefined);
+          if (tx) tx.__reqDone();
+        } catch (e) { failReq(r, e); if (tx) tx.__reqFail(e); }
+      });
+      return r;
+    };
+    IDBCursor.prototype.update = function (value) {
+      var view = this.__view;
+      var r = new IDBRequest(view, view && view.__tx);
+      var st = this.__st, pk = this.primaryKey, tx = view && view.__tx;
+      if (tx) tx.__pend++;
+      var self = this;
+      sched(function () {
+        try {
+          var old = st.__data.get(pk);
+          if (old !== undefined) st.__indexRemove(pk, old);
+          st.__data.set(pk, value);
+          st.__indexAdd(pk, value);
+          persist(st.__db.name, st.name, 'put', pk, value);
+          self.value = value;
+          okReq(r, pk);
+          if (tx) tx.__reqDone();
+        } catch (e) { failReq(r, e); if (tx) tx.__reqFail(e); }
+      });
+      return r;
+    };
+
+    /* -- database -- */
+    function IDBDatabase(name) {
+      Emitter.call(this);
+      this.name = name;
+      this.version = 0;
+      this.__stores = {};
+      this.__closed = false;
+      this.__everOpened = false;
+    }
+    IDBDatabase.prototype = Object.create(Emitter.prototype);
+    Object.defineProperty(IDBDatabase.prototype, 'objectStoreNames', { get: function () { return namesList(Object.keys(this.__stores)); }, configurable: true });
+    IDBDatabase.prototype.createObjectStore = function (name, opts) {
+      if (this.__stores[name]) throw errObj('ConstraintError', 'store already exists: ' + name);
+      var st = new IDBStore(this, name, opts);
+      this.__stores[name] = st;
+      return new StoreView(new IDBTx(this, [name], 'versionchange'), st);
+    };
+    IDBDatabase.prototype.deleteObjectStore = function (name) { delete this.__stores[name]; };
+    IDBDatabase.prototype.transaction = function (names, mode) {
+      if (this.__closed) throw errObj('InvalidStateError', 'database is closed');
+      var arr = (typeof names === 'string') ? [names] : names.slice();
+      if (!arr.length) throw errObj('InvalidAccessError', 'no stores requested');
+      for (var i = 0; i < arr.length; i++) {
+        if (!this.__stores[arr[i]]) throw errObj('NotFoundError', 'no such store: ' + arr[i]);
+      }
+      var tx = new IDBTx(this, arr, mode || 'readonly');
+      tx.__arm();
+      return tx;
+    };
+    IDBDatabase.prototype.close = function () { this.__closed = true; };
+
+    /* seed: the shell's snapshot of previously persisted writes */
+    var SEED_IDB = null;
+    try {
+      if (window.__MP_SEED__ && window.__MP_SEED__.mp === 1 && window.__MP_SEED__.idb && typeof window.__MP_SEED__.idb === 'object') SEED_IDB = window.__MP_SEED__.idb;
+    } catch (eSeed) { SEED_IDB = null; }
+    function applySeed(db) {
+      try {
+        if (!SEED_IDB || !PERSIST_DBS[db.name]) return;
+        var stores = SEED_IDB[db.name];
+        if (!stores) return;
+        Object.keys(stores).forEach(function (sn) {
+          var st = db.__stores[sn];
+          if (!st) return;
+          var entries = stores[sn];
+          if (!entries) return;
+          Object.keys(entries).forEach(function (ks) {
+            try {
+              var k = kunser(ks);
+              var v = entries[ks];
+              st.__data.set(k, v);
+              st.__indexAdd(k, v);
+              if (typeof k === 'number' && k >= st.__keyGen) st.__keyGen = k + 1;
+            } catch (eE) { /* ignore */ }
+          });
+        });
+      } catch (eAS) { /* ignore */ }
+    }
+
+    /* -- factory -- */
+    var DBS = {};
+    function openDB(name, version) {
+      var req = new IDBRequest(null, null);
+      var rec = DBS[name];
+      if (rec && version !== undefined && version !== null && rec.db.version > version) {
+        sched(function () { failReq(req, errObj('VersionError', 'requested version is lower than the existing one')); });
+        return req;
+      }
+      if (!rec) { rec = { db: new IDBDatabase(name) }; DBS[name] = rec; }
+      var db = rec.db;
+      var oldV = db.version;
+      var doUpgrade = !db.__everOpened || (version !== undefined && version !== null && version > db.version);
+      if (version !== undefined && version !== null) db.version = version;
+      else if (!db.version) db.version = 1;
+      db.__closed = false;
+      var self = this;
+      sched(function () {
+        try {
+          /* result is visible from upgradeneeded on — the app's upgrade
+           * handler reads r.target.result to createObjectStore, so it
+           * must be the db BEFORE that event fires (a plain-undefined
+           * result there kills the whole store schema). */
+          db.__everOpened = true;
+          req.result = db;
+          if (doUpgrade) {
+            var vtx = new IDBTx(db, [], 'versionchange');
+            var ev = new Ev('upgradeneeded');
+            ev.target = req;
+            ev.oldVersion = oldV;
+            ev.newVersion = db.version;
+            req.transaction = vtx;
+            req.dispatchEvent(ev);
+            req.transaction = null;
+          }
+          applySeed(db);
+          req.readyState = 'done';
+          req.dispatchEvent(new Ev('success'));
+        } catch (eO) {
+          failReq(req, eO);
+        }
+      });
+      return req;
+    }
+    var factory = {
+      open: function (name, version) { return openDB(name, version); },
+      deleteDatabase: function (name) {
+        var r = new IDBRequest(null, null);
+        delete DBS[name];
+        sched(function () { okReq(r, undefined); });
+        return r;
+      },
+      databases: function () {
+        return Promise.resolve(Object.keys(DBS).map(function (n) { return { name: n, version: DBS[n].db.version }; }));
+      },
+      cmp: function (a, b) { return cmpKeys(a, b); }
+    };
+    try {
+      Object.defineProperty(window, 'indexedDB', { value: factory, configurable: true, writable: false });
+    } catch (eDef) {
+      try { window.indexedDB = factory; } catch (eSet) { /* ignore */ }
+    }
+  })();
+
 
   /* ---------- escape sentinel ------------------------------------------
    * pagehide fires when this frame navigates ANYWHERE (the one thing
