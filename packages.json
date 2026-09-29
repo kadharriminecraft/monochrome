@@ -1,0 +1,8 @@
+{
+  "name": "monochrome",
+  "version": "1.0.0",
+  "private": false,
+  "devDependencies": {
+    "wrangler": "4.129.0"
+  }
+}
